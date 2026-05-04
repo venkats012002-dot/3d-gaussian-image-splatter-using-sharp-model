@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>SHARP particle viewer</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; padding: 0; height: 100%; background: #0a0a0a; color: #ddd; font-family: -apple-system, BlinkMacSystemFont, sans-serif; overflow: hidden; }
+  #app { display: grid; grid-template-columns: 280px 1fr; height: 100vh; }
+
+  /* Sidebar */
+  #sidebar { background: #111; border-right: 1px solid #222; display: flex; flex-direction: column; min-width: 0; }
+  #sidebar header { padding: 14px 16px; border-bottom: 1px solid #222; }
+  #sidebar h1 { margin: 0 0 4px; font-size: 15px; font-weight: 600; }
+  #sidebar .sub { font-size: 11px; color: #888; }
+  #upload-row { padding: 12px 16px; border-bottom: 1px solid #222; }
+  #upload-btn { width: 100%; padding: 10px 12px; background: #2a6df4; color: #fff; border: 0; border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: 500; }
+  #upload-btn:hover:not(:disabled) { background: #4480ff; }
+  #upload-btn:disabled { background: #333; cursor: not-allowed; }
+  #upload-status { margin-top: 8px; font-size: 11px; color: #888; min-height: 14px; }
+  #scene-list { flex: 1; overflow-y: auto; padding: 8px; }
+  .scene { display: flex; gap: 10px; padding: 8px; border-radius: 6px; cursor: pointer; align-items: center; margin-bottom: 4px; }
+  .scene:hover { background: #1a1a1a; }
+  .scene.active { background: #1f2d4d; }
+  .scene img { width: 56px; height: 56px; object-fit: cover; border-radius: 4px; background: #222; flex-shrink: 0; }
+  .scene .meta { min-width: 0; flex: 1; }
+  .scene .meta .name { font-size: 12px; color: #ddd; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .scene .meta .id { font-size: 10px; color: #666; margin-top: 2px; font-family: ui-monospace, monospace; }
+
+  /* Main viewer */
+  #main { position: relative; min-width: 0; }
+  #info { position: absolute; top: 12px; left: 12px; padding: 8px 12px; background: rgba(0,0,0,0.65); border-radius: 6px; font-size: 12px; z-index: 10; backdrop-filter: blur(8px); }
+  #info code { color: #8cf; }
+  #controls { position: absolute; bottom: 12px; left: 12px; padding: 10px 14px; background: rgba(0,0,0,0.65); border-radius: 8px; font-size: 12px; z-index: 10; backdrop-filter: blur(8px); display: none; gap: 14px; align-items: center; }
+  #controls label { display: flex; align-items: center; gap: 6px; }
+  #controls input[type=range] { width: 100px; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<div id="app">
+  <aside id="sidebar">
+    <header>
+      <h1>SHARP scenes</h1>
+      <div class="sub">Image → 3D particle cloud</div>
+    </header>
+    <div id="upload-row">
+      <input type="file" id="upload-input" accept="image/png,image/jpeg,image/webp,image/heic" hidden />
+      <button id="upload-btn">Upload image</button>
+      <div id="upload-status"></div>
+    </div>
+    <div id="scene-list">Loading...</div>
+  </aside>
+
+  <main id="main">
+    <div id="info">Pick a scene from the sidebar.</div>
+    <div id="controls">
+      <label>Size <input type="range" id="sizeSlider" min="0.1" max="10" step="0.1" value="2" /></label>
+      <label>Opacity <input type="range" id="opacitySlider" min="0.1" max="1" step="0.05" value="0.85" /></label>
+      <label><input type="checkbox" id="roundDots" checked /> round</label>
+    </div>
+  </main>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.157.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.157.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+const SH_C0 = 0.28209479177387814;
+const sigmoid = (x) => 1 / (1 + Math.exp(-x));
+
+const info = document.getElementById('info');
+const sceneListEl = document.getElementById('scene-list');
+const uploadBtn = document.getElementById('upload-btn');
+const uploadInput = document.getElementById('upload-input');
+const uploadStatus = document.getElementById('upload-status');
+
+async function loadPly(url) {
+  info.textContent = `Downloading ${url}...`;
+  const buf = new Uint8Array(await (await fetch(url)).arrayBuffer());
+
+  const headerEndMarker = new TextEncoder().encode('end_header\n');
+  let headerEnd = -1;
+  for (let i = 0; i < buf.length - headerEndMarker.length; i++) {
+    let match = true;
+    for (let j = 0; j < headerEndMarker.length; j++) {
+      if (buf[i + j] !== headerEndMarker[j]) { match = false; break; }
+    }
+    if (match) { headerEnd = i + headerEndMarker.length; break; }
+  }
+  if (headerEnd < 0) throw new Error('No PLY header end found');
+
+  const headerText = new TextDecoder().decode(buf.subarray(0, headerEnd));
+  const lines = headerText.split('\n');
+
+  let vertexCount = 0;
+  const props = [];
+  let inVertex = false;
+  for (const line of lines) {
+    if (line.startsWith('element vertex')) {
+      vertexCount = parseInt(line.split(' ')[2], 10);
+      inVertex = true;
+    } else if (line.startsWith('element ')) {
+      inVertex = false;
+    } else if (inVertex && line.startsWith('property ')) {
+      const parts = line.split(' ');
+      props.push({ name: parts[2], type: parts[1] });
+    }
+  }
+
+  info.textContent = `Parsing ${vertexCount.toLocaleString()} gaussians...`;
+
+  const idx = (n) => props.findIndex(p => p.name === n);
+  const ix = idx('x'), iy = idx('y'), iz = idx('z');
+  const id0 = idx('f_dc_0'), id1 = idx('f_dc_1'), id2 = idx('f_dc_2');
+  const iop = idx('opacity');
+
+  const stride = props.length * 4;
+  const dv = new DataView(buf.buffer, buf.byteOffset + headerEnd);
+
+  const positions = new Float32Array(vertexCount * 3);
+  const colors = new Float32Array(vertexCount * 3);
+
+  for (let i = 0; i < vertexCount; i++) {
+    const base = i * stride;
+    positions[i * 3 + 0] = dv.getFloat32(base + ix * 4, true);
+    positions[i * 3 + 1] = dv.getFloat32(base + iy * 4, true);
+    positions[i * 3 + 2] = dv.getFloat32(base + iz * 4, true);
+
+    const r = 0.5 + SH_C0 * dv.getFloat32(base + id0 * 4, true);
+    const g = 0.5 + SH_C0 * dv.getFloat32(base + id1 * 4, true);
+    const b = 0.5 + SH_C0 * dv.getFloat32(base + id2 * 4, true);
+    colors[i * 3 + 0] = Math.max(0, Math.min(1, r));
+    colors[i * 3 + 1] = Math.max(0, Math.min(1, g));
+    colors[i * 3 + 2] = Math.max(0, Math.min(1, b));
+  }
+
+  return { positions, colors, vertexCount };
+}
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setClearColor(0x0a0a0a, 1);
+document.getElementById('main').appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(60, 1, 0.01, 100);
+camera.position.set(0, 0, -1.2);
+camera.up.set(0, -1, 0);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.target.set(0, 0, 1.5);
+
+function makeDotTexture() {
+  const size = 64;
+  const c = document.createElement('canvas');
+  c.width = c.height = size;
+  const ctx = c.getContext('2d');
+  const grad = ctx.createRadialGradient(size/2, size/2, 0, size/2, size/2, size/2);
+  grad.addColorStop(0, 'rgba(255,255,255,1)');
+  grad.addColorStop(0.5, 'rgba(255,255,255,0.85)');
+  grad.addColorStop(1, 'rgba(255,255,255,0)');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, size, size);
+  const t = new THREE.CanvasTexture(c);
+  t.needsUpdate = true;
+  return t;
+}
+const dotTex = makeDotTexture();
+
+let points = null;
+let material = null;
+let activeId = null;
+
+function buildMaterial() {
+  return new THREE.PointsMaterial({
+    size: parseFloat(document.getElementById('sizeSlider').value) * 0.004,
+    sizeAttenuation: true,
+    vertexColors: true,
+    transparent: true,
+    opacity: parseFloat(document.getElementById('opacitySlider').value),
+    map: document.getElementById('roundDots').checked ? dotTex : null,
+    alphaTest: document.getElementById('roundDots').checked ? 0.05 : 0,
+    depthWrite: false,
+    blending: THREE.NormalBlending,
+  });
+}
+
+async function loadScene(entry) {
+  activeId = entry.id;
+  document.querySelectorAll('.scene').forEach(el => el.classList.toggle('active', el.dataset.id === entry.id));
+
+  if (points) {
+    scene.remove(points);
+    points.geometry.dispose();
+    points.material.dispose();
+    points = null;
+  }
+  try {
+    const { positions, colors, vertexCount } = await loadPly(`/splats/${entry.ply}`);
+    const geom = new THREE.BufferGeometry();
+    geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geom.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    geom.computeBoundingSphere();
+    material = buildMaterial();
+    points = new THREE.Points(geom, material);
+    scene.add(points);
+
+    camera.position.set(0, 0, -1.2);
+    controls.target.set(0, 0, 1.5);
+    controls.update();
+
+    info.innerHTML = `<code>${entry.name}</code> · ${vertexCount.toLocaleString()} particles · drag = orbit · scroll = zoom`;
+    document.getElementById('controls').style.display = 'flex';
+  } catch (err) {
+    info.textContent = 'Failed: ' + err.message;
+    console.error(err);
+  }
+}
+
+function renderSidebar(scenes) {
+  if (!scenes.length) {
+    sceneListEl.innerHTML = '<div style="padding:14px;font-size:12px;color:#666">No scenes yet. Upload an image to start.</div>';
+    return;
+  }
+  sceneListEl.innerHTML = '';
+  for (const s of scenes) {
+    const el = document.createElement('div');
+    el.className = 'scene' + (s.id === activeId ? ' active' : '');
+    el.dataset.id = s.id;
+    const thumbHtml = s.thumb ? `<img src="/thumbs/${s.thumb}" alt="" />` : '<div style="width:56px;height:56px;background:#222;border-radius:4px;flex-shrink:0"></div>';
+    el.innerHTML = `${thumbHtml}<div class="meta"><div class="name">${s.name}</div><div class="id">${s.id}</div></div>`;
+    el.addEventListener('click', () => loadScene(s));
+    sceneListEl.appendChild(el);
+  }
+}
+
+async function refreshList(autoload = false) {
+  const r = await fetch('/list');
+  const scenes = await r.json();
+  renderSidebar(scenes);
+  if (autoload && scenes.length && !activeId) {
+    loadScene(scenes[scenes.length - 1]);
+  }
+  return scenes;
+}
+
+uploadBtn.addEventListener('click', () => uploadInput.click());
+
+uploadInput.addEventListener('change', async () => {
+  const file = uploadInput.files?.[0];
+  if (!file) return;
+  uploadInput.value = '';
+
+  uploadBtn.disabled = true;
+  const startedAt = Date.now();
+  const tick = setInterval(() => {
+    const sec = Math.round((Date.now() - startedAt) / 1000);
+    uploadStatus.textContent = `Running SHARP on MPS... ${sec}s`;
+  }, 500);
+
+  try {
+    const fd = new FormData();
+    fd.append('image', file);
+    const r = await fetch('/upload', { method: 'POST', body: fd });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error || 'upload failed');
+    uploadStatus.textContent = 'Done.';
+    const scenes = await refreshList(false);
+    const entry = scenes.find(s => s.id === data.id) || data;
+    loadScene(entry);
+  } catch (err) {
+    uploadStatus.textContent = 'Error: ' + err.message;
+    console.error(err);
+  } finally {
+    clearInterval(tick);
+    uploadBtn.disabled = false;
+    setTimeout(() => { if (!uploadBtn.disabled) uploadStatus.textContent = ''; }, 4000);
+  }
+});
+
+function resize() {
+  const main = document.getElementById('main');
+  const w = main.clientWidth, h = main.clientHeight;
+  renderer.setSize(w, h);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+}
+window.addEventListener('resize', resize);
+resize();
+
+// Wire control sliders
+document.getElementById('sizeSlider').addEventListener('input', (e) => {
+  if (material) material.size = parseFloat(e.target.value) * 0.004;
+});
+document.getElementById('opacitySlider').addEventListener('input', (e) => {
+  if (material) material.opacity = parseFloat(e.target.value);
+});
+document.getElementById('roundDots').addEventListener('change', (e) => {
+  if (!material) return;
+  material.map = e.target.checked ? dotTex : null;
+  material.alphaTest = e.target.checked ? 0.05 : 0;
+  material.needsUpdate = true;
+});
+
+function animate() {
+  requestAnimationFrame(animate);
+  controls.update();
+  renderer.render(scene, camera);
+}
+animate();
+
+refreshList(true);
+</script>
+</body>
+</html>
