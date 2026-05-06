@@ -26,6 +26,9 @@
   .scene .meta { min-width: 0; flex: 1; }
   .scene .meta .name { font-size: 12px; color: #ddd; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .scene .meta .id { font-size: 10px; color: #666; margin-top: 2px; font-family: ui-monospace, monospace; }
+  .scene .delete { opacity: 0; background: transparent; border: 0; color: #888; cursor: pointer; font-size: 16px; line-height: 1; padding: 4px 6px; border-radius: 4px; flex-shrink: 0; transition: opacity 0.15s, background 0.15s, color 0.15s; }
+  .scene:hover .delete { opacity: 1; }
+  .scene .delete:hover { background: #4a1f1f; color: #f88; }
 
   /* Main viewer */
   #main { position: relative; min-width: 0; }
@@ -55,6 +58,7 @@
   <main id="main">
     <div id="info">Pick a scene from the sidebar.</div>
     <div id="controls">
+      <label>Particles <input type="range" id="countSlider" min="0" max="100" step="1" value="100" /><span id="countLabel" style="font-variant-numeric:tabular-nums;min-width:90px;color:#8cf">—</span></label>
       <label>Size <input type="range" id="sizeSlider" min="0.1" max="10" step="0.1" value="2" /></label>
       <label>Opacity <input type="range" id="opacitySlider" min="0.1" max="1" step="0.05" value="0.85" /></label>
       <label><input type="checkbox" id="roundDots" checked /> round</label>
@@ -182,6 +186,13 @@ const dotTex = makeDotTexture();
 let points = null;
 let material = null;
 let activeId = null;
+// Per-scene full buffers + shuffled index permutation, used to rebuild
+// geometry when the user changes the particle count.
+let fullPositions = null;
+let fullColors = null;
+let permutation = null; // Uint32Array, shuffled indices into the full arrays
+let totalCount = 0;
+let currentCount = 0;
 
 function buildMaterial() {
   return new THREE.PointsMaterial({
@@ -197,6 +208,50 @@ function buildMaterial() {
   });
 }
 
+function buildShuffledPermutation(n) {
+  // Fisher-Yates over a Uint32Array
+  const a = new Uint32Array(n);
+  for (let i = 0; i < n; i++) a[i] = i;
+  for (let i = n - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    const tmp = a[i]; a[i] = a[j]; a[j] = tmp;
+  }
+  return a;
+}
+
+function rebuildPoints(count) {
+  if (!fullPositions) return;
+  count = Math.max(1, Math.min(totalCount, count | 0));
+  currentCount = count;
+
+  const positions = new Float32Array(count * 3);
+  const colors = new Float32Array(count * 3);
+  for (let i = 0; i < count; i++) {
+    const src = permutation[i];
+    positions[i * 3 + 0] = fullPositions[src * 3 + 0];
+    positions[i * 3 + 1] = fullPositions[src * 3 + 1];
+    positions[i * 3 + 2] = fullPositions[src * 3 + 2];
+    colors[i * 3 + 0] = fullColors[src * 3 + 0];
+    colors[i * 3 + 1] = fullColors[src * 3 + 1];
+    colors[i * 3 + 2] = fullColors[src * 3 + 2];
+  }
+
+  if (points) {
+    scene.remove(points);
+    points.geometry.dispose();
+  }
+  const geom = new THREE.BufferGeometry();
+  geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geom.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  geom.computeBoundingSphere();
+  if (!material) material = buildMaterial();
+  points = new THREE.Points(geom, material);
+  scene.add(points);
+
+  document.getElementById('countLabel').textContent =
+    `${currentCount.toLocaleString()} / ${totalCount.toLocaleString()}`;
+}
+
 async function loadScene(entry) {
   activeId = entry.id;
   document.querySelectorAll('.scene').forEach(el => el.classList.toggle('active', el.dataset.id === entry.id));
@@ -204,18 +259,23 @@ async function loadScene(entry) {
   if (points) {
     scene.remove(points);
     points.geometry.dispose();
-    points.material.dispose();
+    if (points.material) points.material.dispose();
     points = null;
   }
+  fullPositions = null; fullColors = null; permutation = null;
   try {
     const { positions, colors, vertexCount } = await loadPly(`/splats/${entry.ply}`);
-    const geom = new THREE.BufferGeometry();
-    geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-    geom.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-    geom.computeBoundingSphere();
+    fullPositions = positions;
+    fullColors = colors;
+    totalCount = vertexCount;
+    permutation = buildShuffledPermutation(vertexCount);
+
     material = buildMaterial();
-    points = new THREE.Points(geom, material);
-    scene.add(points);
+
+    // Reset slider to 100% on a new scene
+    const slider = document.getElementById('countSlider');
+    slider.value = '100';
+    rebuildPoints(totalCount);
 
     camera.position.set(0, 0, -1.2);
     controls.target.set(0, 0, 1.5);
@@ -240,9 +300,44 @@ function renderSidebar(scenes) {
     el.className = 'scene' + (s.id === activeId ? ' active' : '');
     el.dataset.id = s.id;
     const thumbHtml = s.thumb ? `<img src="/thumbs/${s.thumb}" alt="" />` : '<div style="width:56px;height:56px;background:#222;border-radius:4px;flex-shrink:0"></div>';
-    el.innerHTML = `${thumbHtml}<div class="meta"><div class="name">${s.name}</div><div class="id">${s.id}</div></div>`;
+    el.innerHTML = `${thumbHtml}<div class="meta"><div class="name"></div><div class="id"></div></div><button class="delete" title="Delete scene">×</button>`;
+    el.querySelector('.name').textContent = s.name;
+    el.querySelector('.id').textContent = s.id;
     el.addEventListener('click', () => loadScene(s));
+    el.querySelector('.delete').addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      deleteScene(s);
+    });
     sceneListEl.appendChild(el);
+  }
+}
+
+async function deleteScene(s) {
+  if (!confirm(`Delete "${s.name}"? This removes the .ply and the original image.`)) return;
+  try {
+    const r = await fetch(`/delete/${encodeURIComponent(s.id)}`, { method: 'DELETE' });
+    if (!r.ok) {
+      const data = await r.json().catch(() => ({}));
+      throw new Error(data.error || `HTTP ${r.status}`);
+    }
+    const wasActive = s.id === activeId;
+    if (wasActive) {
+      if (points) {
+        scene.remove(points);
+        points.geometry.dispose();
+        if (points.material) points.material.dispose();
+        points = null;
+      }
+      activeId = null;
+      fullPositions = null; fullColors = null; permutation = null; totalCount = 0;
+      info.textContent = 'Pick a scene from the sidebar.';
+      document.getElementById('controls').style.display = 'none';
+    }
+    const scenes = await refreshList(false);
+    if (wasActive && scenes.length) loadScene(scenes[scenes.length - 1]);
+  } catch (err) {
+    alert('Delete failed: ' + err.message);
+    console.error(err);
   }
 }
 
@@ -312,6 +407,22 @@ document.getElementById('roundDots').addEventListener('change', (e) => {
   material.map = e.target.checked ? dotTex : null;
   material.alphaTest = e.target.checked ? 0.05 : 0;
   material.needsUpdate = true;
+});
+
+// Particle count: live preview of the label as you drag, but only rebuild on
+// release (`change`). Rebuilding 1M+ particles per pixel of drag is too much.
+document.getElementById('countSlider').addEventListener('input', (e) => {
+  if (!totalCount) return;
+  const pct = parseFloat(e.target.value);
+  const n = Math.max(1, Math.round(totalCount * pct / 100));
+  document.getElementById('countLabel').textContent =
+    `${n.toLocaleString()} / ${totalCount.toLocaleString()}`;
+});
+document.getElementById('countSlider').addEventListener('change', (e) => {
+  if (!totalCount) return;
+  const pct = parseFloat(e.target.value);
+  const n = Math.max(1, Math.round(totalCount * pct / 100));
+  rebuildPoints(n);
 });
 
 function animate() {

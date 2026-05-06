@@ -84,6 +84,26 @@ def list_splats():
     return jsonify(load_meta())
 
 
+@app.route("/delete/<sid>", methods=["DELETE"])
+def delete_splat(sid):
+    meta = load_meta()
+    entry = next((e for e in meta if e["id"] == sid), None)
+    if not entry:
+        return jsonify({"error": "not found"}), 404
+
+    ply = OUTPUTS / entry["ply"]
+    if ply.exists():
+        ply.unlink()
+    if entry.get("thumb"):
+        thumb = INPUTS / entry["thumb"]
+        if thumb.exists():
+            thumb.unlink()
+
+    meta = [e for e in meta if e["id"] != sid]
+    save_meta(meta)
+    return jsonify({"ok": True, "id": sid})
+
+
 @app.route("/upload", methods=["POST"])
 def upload():
     f = request.files.get("image")
